@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -278,3 +279,401 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+
+class ConformerFeedForward(nn.Module):
+    """Conformer feed-forward module with pre-norm and half-step residual.
+
+    Input/output shape: (T, N, d_model).
+    """
+
+    def __init__(self, d_model: int, expansion_factor: int = 4, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * expansion_factor),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * expansion_factor, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + 0.5 * self.ff(self.norm(x))
+
+
+class ConformerConvolution(nn.Module):
+    """Conformer convolution module: pointwise → GLU → depthwise → BN → SiLU → pointwise.
+
+    Input/output shape: (T, N, d_model).
+
+    Args:
+        d_model (int): Model dimension.
+        kernel_size (int): Depthwise conv kernel size (must be odd). (default: 31)
+        dropout (float): Dropout applied after final pointwise conv. (default: 0.1)
+    """
+
+    def __init__(self, d_model: int, kernel_size: int = 31, dropout: float = 0.1) -> None:
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size must be odd"
+        self.norm = nn.LayerNorm(d_model)
+        self.pointwise_expand = nn.Linear(d_model, 2 * d_model)
+        self.glu = nn.GLU(dim=-1)
+        self.depthwise = nn.Conv1d(
+            d_model, d_model,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+            groups=d_model,
+        )
+        self.batch_norm = nn.BatchNorm1d(d_model)
+        self.activation = nn.SiLU()
+        self.pointwise_project = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm(x)                          # (T, N, d_model)
+        x = self.pointwise_expand(x)              # (T, N, 2*d_model)
+        x = self.glu(x)                           # (T, N, d_model)
+        T, N, d = x.shape
+        x = x.permute(1, 2, 0)                    # (N, d_model, T)
+        x = self.depthwise(x)                     # (N, d_model, T)
+        x = self.batch_norm(x)
+        x = self.activation(x)
+        x = x.permute(2, 0, 1)                    # (T, N, d_model)
+        x = self.pointwise_project(x)
+        x = self.dropout(x)
+        return residual + x
+
+
+class ConformerBlock(nn.Module):
+    """Single Conformer block: ½FF → MHSA → Conv → ½FF → LayerNorm.
+
+    Input/output shape: (T, N, d_model).
+
+    Args:
+        d_model (int): Model dimension.
+        nhead (int): Number of attention heads.
+        ff_expansion_factor (int): FFN hidden dim multiplier. (default: 4)
+        conv_kernel_size (int): Depthwise conv kernel size. (default: 31)
+        dropout (float): Dropout applied throughout. (default: 0.1)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        ff_expansion_factor: int = 4,
+        conv_kernel_size: int = 31,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.ff1 = ConformerFeedForward(d_model, ff_expansion_factor, dropout)
+        self.attn_norm = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.conv = ConformerConvolution(d_model, conv_kernel_size, dropout)
+        self.ff2 = ConformerFeedForward(d_model, ff_expansion_factor, dropout)
+        self.norm_out = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.ff1(x)
+        # Multi-head self-attention with pre-norm
+        residual = x
+        x_norm = self.attn_norm(x)
+        x_attn, _ = self.attn(x_norm, x_norm, x_norm)
+        x = residual + self.attn_dropout(x_attn)
+        x = self.conv(x)
+        x = self.ff2(x)
+        return self.norm_out(x)
+
+
+class ConformerEncoder(nn.Module):
+    """2D CNN feature extractor followed by a stack of Conformer blocks.
+
+    The CNN reduces the (bands, electrode_channels, freq_bins) spatial dims
+    to a single feature vector per time step. The Conformer blocks then model
+    both local (via depthwise conv) and global (via attention) temporal context.
+
+    Input shape:  (T, N, bands, electrode_channels, freq_bins)
+    Output shape: (T, N, model_dim)
+
+    Args:
+        bands (int): Number of EMG bands.
+        electrode_channels (int): Electrode channels per band.
+        cnn_channels (list): Output channels per CNN layer.
+            (default: ``(64, 128, 256)``)
+        model_dim (int): Conformer model dimension. (default: 256)
+        nhead (int): Number of attention heads. (default: 4)
+        num_layers (int): Number of Conformer blocks. (default: 6)
+        ff_expansion_factor (int): FFN hidden dim multiplier. (default: 4)
+        conv_kernel_size (int): Depthwise conv kernel size in each block.
+            (default: 31)
+        dropout (float): Dropout applied throughout. (default: 0.1)
+        attn_chunk_size (int): Max time steps per attention chunk during
+            inference to bound memory on long sequences. (default: 1000)
+    """
+
+    def __init__(
+        self,
+        bands: int,
+        electrode_channels: int,
+        cnn_channels: Sequence[int] = (64, 128, 256),
+        model_dim: int = 256,
+        nhead: int = 4,
+        num_layers: int = 6,
+        ff_expansion_factor: int = 4,
+        conv_kernel_size: int = 31,
+        dropout: float = 0.1,
+        attn_chunk_size: int = 1000,
+    ) -> None:
+        super().__init__()
+        self.attn_chunk_size = attn_chunk_size
+
+        self.cnn = CNNFeatureExtractor(
+            bands=bands,
+            electrode_channels=electrode_channels,
+            cnn_channels=cnn_channels,
+            dropout=dropout,
+        )
+        self.input_proj = nn.Linear(self.cnn.out_channels, model_dim)
+        self.pos_encoding = PositionalEncoding(model_dim, dropout=dropout)
+        self.blocks = nn.ModuleList([
+            ConformerBlock(
+                d_model=model_dim,
+                nhead=nhead,
+                ff_expansion_factor=ff_expansion_factor,
+                conv_kernel_size=conv_kernel_size,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.cnn(x)           # (T, N, cnn_out_channels)
+        x = self.input_proj(x)    # (T, N, model_dim)
+        x = self.pos_encoding(x)  # (T, N, model_dim)
+        if not self.training and x.size(0) > self.attn_chunk_size:
+            # Chunk only the attention — depthwise conv handles boundaries locally
+            chunks = x.split(self.attn_chunk_size, dim=0)
+            outs = []
+            for chunk in chunks:
+                for block in self.blocks:
+                    chunk = block(chunk)
+                outs.append(chunk)
+            x = torch.cat(outs, dim=0)
+        else:
+            for block in self.blocks:
+                x = block(x)
+        return x  # (T, N, model_dim)
+
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for transformer inputs.
+
+    Input/output shape: (T, N, d_model).
+
+    Args:
+        d_model (int): Embedding / model dimension.
+        dropout (float): Dropout probability applied after adding positional
+            encodings. (default: 0.1)
+        max_len (int): Maximum sequence length supported. (default: 10000)
+    """
+
+    def __init__(
+        self, d_model: int, dropout: float = 0.1, max_len: int = 10000
+    ) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)  # (max_len, 1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)
+        )
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        T = x.size(0)
+        if T > self.pe.size(0):
+            # Compute PE on-the-fly for sequences longer than max_len
+            d_model = self.pe.size(-1)
+            position = torch.arange(T, device=x.device, dtype=torch.float).unsqueeze(1)
+            div_term = torch.exp(
+                torch.arange(0, d_model, 2, device=x.device, dtype=torch.float)
+                * (-math.log(10000.0) / d_model)
+            )
+            pe = torch.zeros(T, 1, d_model, device=x.device)
+            pe[:, 0, 0::2] = torch.sin(position * div_term)
+            pe[:, 0, 1::2] = torch.cos(position * div_term)
+            x = x + pe
+        else:
+            x = x + self.pe[:T]
+        return self.dropout(x)
+
+
+class CNNFeatureExtractor(nn.Module):
+    """Extracts local spectrogram features using 2D convolutions.
+
+    Treats all electrode channels across both bands as the channel dimension
+    and (freq, time) as the spatial dimensions. Frequency is progressively
+    downsampled while the time dimension is kept intact to preserve temporal
+    resolution for CTC.
+
+    Input shape:  (T, N, bands, electrode_channels, freq_bins)
+    Output shape: (T, N, cnn_channels[-1])
+
+    Args:
+        bands (int): Number of EMG bands (e.g. 2 for left/right).
+        electrode_channels (int): Electrode channels per band (e.g. 16).
+        cnn_channels (list): Number of output channels per Conv2d layer.
+            Frequency stride 2 is applied at every even-indexed layer (0-based)
+            starting from index 1. (default: ``(64, 128, 256, 256)``)
+        dropout (float): Dropout probability after each conv block.
+            (default: 0.1)
+    """
+
+    def __init__(
+        self,
+        bands: int,
+        electrode_channels: int,
+        cnn_channels: Sequence[int] = (64, 128, 256, 256),
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        in_ch = bands * electrode_channels
+        layers: list[nn.Module] = []
+        for i, out_ch in enumerate(cnn_channels):
+            # Downsample freq every other layer (indices 1, 3, ...)
+            freq_stride = 2 if i % 2 == 1 else 1
+            layers.extend(
+                [
+                    nn.Conv2d(
+                        in_ch,
+                        out_ch,
+                        kernel_size=(3, 3),
+                        stride=(freq_stride, 1),
+                        padding=(1, 1),
+                    ),
+                    nn.BatchNorm2d(out_ch),
+                    nn.GELU(),
+                    nn.Dropout2d(p=dropout),
+                ]
+            )
+            in_ch = out_ch
+
+        self.cnn = nn.Sequential(*layers)
+        # Pool remaining freq bins to a single value
+        self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
+        self.out_channels = cnn_channels[-1]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        T, N, bands, C, freq = x.shape
+        # (T, N, bands, C, freq) -> (N, bands*C, freq, T)
+        x = x.permute(1, 2, 3, 4, 0).reshape(N, bands * C, freq, T)
+        # (N, bands*C, freq, T) -> (N, out_channels, freq', T)
+        x = self.cnn(x)
+        # (N, out_channels, freq', T) -> (N, out_channels, 1, T)
+        x = self.freq_pool(x)
+        # (N, out_channels, 1, T) -> (T, N, out_channels)
+        return x.squeeze(2).permute(2, 0, 1)
+
+
+class CNNTransformerEncoder(nn.Module):
+    """A 2D CNN feature extractor followed by a Transformer encoder.
+
+    The CNN captures local frequency-electrode patterns at each time step
+    while the Transformer models long-range temporal dependencies.
+    At inference time, very long sequences are processed in non-overlapping
+    chunks to keep memory bounded.
+
+    Input shape:  (T, N, bands, electrode_channels, freq_bins)
+    Output shape: (T, N, model_dim)
+
+    Args:
+        bands (int): Number of EMG bands.
+        electrode_channels (int): Electrode channels per band.
+        cnn_channels (list): Output channels per CNN layer.
+            (default: ``(64, 128, 256, 256)``)
+        model_dim (int): Transformer model dimension. (default: 256)
+        nhead (int): Number of attention heads. (default: 8)
+        num_layers (int): Number of Transformer encoder layers. (default: 4)
+        dim_feedforward (int): FFN inner dimension. (default: 1024)
+        dropout (float): Dropout applied throughout. (default: 0.1)
+        attn_chunk_size (int): Maximum sequence length per attention chunk
+            during inference to avoid OOM on long sessions. (default: 1000)
+    """
+
+    def __init__(
+        self,
+        bands: int,
+        electrode_channels: int,
+        cnn_channels: Sequence[int] = (64, 128, 256, 256),
+        model_dim: int = 256,
+        nhead: int = 8,
+        num_layers: int = 4,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        attn_chunk_size: int = 1000,
+    ) -> None:
+        super().__init__()
+
+        self.attn_chunk_size = attn_chunk_size
+
+        self.cnn = CNNFeatureExtractor(
+            bands=bands,
+            electrode_channels=electrode_channels,
+            cnn_channels=cnn_channels,
+            dropout=dropout,
+        )
+        self.input_proj = nn.Linear(self.cnn.out_channels, model_dim)
+        self.pos_encoding = PositionalEncoding(model_dim, dropout=dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,  # TNC format (time-first)
+            norm_first=True,    # Pre-LN for better stability
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers, enable_nested_tensor=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training and x.size(0) > self.attn_chunk_size:
+            # Chunk CNN with overlap to avoid boundary artifacts.
+            # Overlap covers the CNN receptive field (9 frames for 4x 3x3 conv layers).
+            overlap = 16
+            chunk_list = list(x.split(self.attn_chunk_size, dim=0))
+            out_chunks = []
+            for i, chunk in enumerate(chunk_list):
+                parts = []
+                if i > 0:
+                    parts.append(chunk_list[i - 1][-overlap:])
+                parts.append(chunk)
+                if i < len(chunk_list) - 1:
+                    parts.append(chunk_list[i + 1][:overlap])
+                out = self.cnn(torch.cat(parts, dim=0))
+                l = overlap if i > 0 else 0
+                r = out.size(0) - overlap if i < len(chunk_list) - 1 else out.size(0)
+                out_chunks.append(out[l:r])
+            x = torch.cat(out_chunks, dim=0)
+        else:
+            x = self.cnn(x)          # (T, N, cnn_out_channels)
+        x = self.input_proj(x)   # (T, N, model_dim)
+        x = self.pos_encoding(x) # (T, N, model_dim)
+
+        if not self.training and x.size(0) > self.attn_chunk_size:
+            # Chunk along time for memory-efficient inference on long sessions
+            chunks = x.split(self.attn_chunk_size, dim=0)
+            x = torch.cat([self.transformer(chunk) for chunk in chunks], dim=0)
+        else:
+            x = self.transformer(x)
+
+        return x  # (T, N, model_dim)

@@ -1,0 +1,18 @@
+# @package _global_
+module:
+  _target_: emg2qwerty.lightning.CNNTransformerCTCModule
+  in_features: 528        # freq_bins * electrode_channels = (n_fft//2+1) * 16 = 33*16
+  cnn_channels: [64, 128, 256, 256]  # 2D CNN output channels per layer
+  model_dim: 256          # Transformer model dimension
+  nhead: 8                # Attention heads (head_dim = model_dim / nhead = 32)
+  num_layers: 4           # Transformer encoder layers
+  dim_feedforward: 1024   # FFN inner dimension
+  dropout: 0.1
+  attn_chunk_size: 1000   # Max T per attention chunk during inference
+  left_context_frames: 112  # Frames to trim per window: left_padding / hop_length = 1800/16
+  right_context_frames: 12  # Frames to trim per window: right_padding / hop_length = 200/16
+
+datamodule:
+  _target_: emg2qwerty.lightning.WindowedEMGDataModule
+  window_length: 8000     # 4 sec windows at 2kHz EMG
+  padding: [1800, 200]    # 900ms past context, 100ms future context

@@ -243,3 +243,49 @@ class SpecAugment:
 
         # (..., C, freq, T) -> (T, ..., C, freq)
         return x.movedim(-1, 0)
+
+
+@dataclass
+class GaussianNoise:
+    """Adds Gaussian noise to the raw EMG signal before spectrogram computation.
+
+    Args:
+        std (float): Standard deviation of the noise relative to the signal.
+            (default: 0.1)
+    """
+
+    std: float = 0.1
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor + torch.randn_like(tensor) * self.std
+
+
+@dataclass
+class ChannelSubset:
+    """Selects the first ``n_channels`` electrode channels from the last dimension.
+    Assumes input shape (T, N, C) where C is the electrode channel dimension.
+
+    Args:
+        n_channels (int): Number of channels to keep.
+    """
+
+    n_channels: int = 16
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor[..., : self.n_channels]
+
+
+@dataclass
+class TemporalDownsample:
+    """Downsamples the EMG signal along the time axis by keeping every ``factor``-th
+    sample, simulating a lower acquisition sampling rate.
+    Assumes input shape (T, ...).
+
+    Args:
+        factor (int): Downsampling factor. factor=2 halves the sampling rate.
+    """
+
+    factor: int = 1
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor[:: self.factor]

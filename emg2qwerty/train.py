@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import torch
+torch.backends.cudnn.enabled=False
 import logging
 import os
 import pprint
@@ -122,6 +124,9 @@ def main(config: DictConfig):
         "best_checkpoint": trainer.checkpoint_callback.best_model_path,
     }
     pprint.pprint(results, sort_dicts=False)
+
+    # Return val/CER so Hydra Optuna sweeper can use it as the objective.
+    return val_metrics[0].get("val/CER", float("inf"))
 
 
 if __name__ == "__main__":

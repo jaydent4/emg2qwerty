@@ -1,0 +1,47 @@
+# @package _global_
+# Simulates 250 Hz sampling rate by downsampling raw EMG by factor 8 (from 2000 Hz).
+to_tensor:
+  _target_: emg2qwerty.transforms.ToTensor
+  fields: [emg_left, emg_right]
+
+temporal_downsample:
+  _target_: emg2qwerty.transforms.TemporalDownsample
+  factor: 8
+
+band_rotation:
+  _target_: emg2qwerty.transforms.ForEach
+  transform:
+    _target_: emg2qwerty.transforms.RandomBandRotation
+    offsets: [-1, 0, 1]
+
+temporal_jitter:
+  _target_: emg2qwerty.transforms.TemporalAlignmentJitter
+  max_offset: 15  # scaled for 250 Hz
+
+logspec:
+  _target_: emg2qwerty.transforms.LogSpectrogram
+  n_fft: 64
+  hop_length: 16
+
+specaug:
+  _target_: emg2qwerty.transforms.SpecAugment
+  n_time_masks: 3
+  time_mask_param: 25
+  n_freq_masks: 2
+  freq_mask_param: 4
+
+transforms:
+  train:
+    - ${to_tensor}
+    - ${temporal_downsample}
+    - ${band_rotation}
+    - ${temporal_jitter}
+    - ${logspec}
+    - ${specaug}
+
+  val:
+    - ${to_tensor}
+    - ${temporal_downsample}
+    - ${logspec}
+
+  test: ${transforms.val}

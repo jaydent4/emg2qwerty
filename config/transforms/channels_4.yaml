@@ -1,0 +1,47 @@
+# @package _global_
+# 4 electrode channels per wrist. in_features = 4 * 33 = 132.
+to_tensor:
+  _target_: emg2qwerty.transforms.ToTensor
+  fields: [emg_left, emg_right]
+
+channel_subset:
+  _target_: emg2qwerty.transforms.ChannelSubset
+  n_channels: 4
+
+band_rotation:
+  _target_: emg2qwerty.transforms.ForEach
+  transform:
+    _target_: emg2qwerty.transforms.RandomBandRotation
+    offsets: [0]  # no rotation with only 4 channels
+
+temporal_jitter:
+  _target_: emg2qwerty.transforms.TemporalAlignmentJitter
+  max_offset: 120
+
+logspec:
+  _target_: emg2qwerty.transforms.LogSpectrogram
+  n_fft: 64
+  hop_length: 16
+
+specaug:
+  _target_: emg2qwerty.transforms.SpecAugment
+  n_time_masks: 3
+  time_mask_param: 25
+  n_freq_masks: 2
+  freq_mask_param: 4
+
+transforms:
+  train:
+    - ${to_tensor}
+    - ${channel_subset}
+    - ${band_rotation}
+    - ${temporal_jitter}
+    - ${logspec}
+    - ${specaug}
+
+  val:
+    - ${to_tensor}
+    - ${channel_subset}
+    - ${logspec}
+
+  test: ${transforms.val}
