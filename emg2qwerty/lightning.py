@@ -201,7 +201,7 @@ class TDSConvCTCModule(pl.LightningModule):
         targets = batch["targets"]
         input_lengths = batch["input_lengths"]
         target_lengths = batch["target_lengths"]
-        N = len(input_lengths)  # batch_size
+        N = len(input_lengths)
 
         emissions = self.forward(inputs)
 
@@ -332,18 +332,13 @@ class GRUCTCModule(pl.LightningModule):
             2 if encoder_bidirectional else 1
         )
 
-        # Model
-        # inputs: (T, N, bands=2, electrode_channels=16, freq)
         self.model = nn.Sequential(
-            # (T, N, bands=2, C=16, freq)
             SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
-            # (T, N, bands=2, mlp_features[-1])
             MultiBandRotationInvariantMLP(
                 in_features=in_features,
                 mlp_features=mlp_features,
                 num_bands=self.NUM_BANDS,
             ),
-            # (T, N, num_features)
             nn.Flatten(start_dim=2),
             GRUEncoder(
                 input_size=num_features,
@@ -352,18 +347,13 @@ class GRUCTCModule(pl.LightningModule):
                 bidirectional=encoder_bidirectional,
                 dropout=encoder_dropout,
             ),
-            # (T, N, encoder_output_size)
             nn.Linear(encoder_output_size, charset().num_classes),
             nn.LogSoftmax(dim=-1),
         )
 
-        # Criterion
         self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
-
-        # Decoder
         self.decoder = instantiate(decoder)
 
-        # Metrics
         metrics = MetricCollection([CharacterErrorRates()])
         self.metrics = nn.ModuleDict(
             {
@@ -386,24 +376,20 @@ class GRUCTCModule(pl.LightningModule):
 
         emissions = self.forward(inputs)
 
-        # The GRU encoder does not change temporal length, so emission_lengths
-        # are the same as input_lengths.
         emission_lengths = input_lengths
 
         loss = self.ctc_loss(
-            log_probs=emissions,  # (T, N, num_classes)
-            targets=targets.transpose(0, 1),  # (T, N) -> (N, T)
-            input_lengths=emission_lengths,  # (N,)
-            target_lengths=target_lengths,  # (N,)
+            log_probs=emissions,
+            targets=targets.transpose(0, 1),
+            input_lengths=emission_lengths,
+            target_lengths=target_lengths,
         )
 
-        # Decode emissions
         predictions = self.decoder.decode_batch(
             emissions=emissions.detach().cpu().numpy(),
             emission_lengths=emission_lengths.detach().cpu().numpy(),
         )
 
-        # Update metrics
         metrics = self.metrics[f"{phase}_metrics"]
         targets = targets.detach().cpu().numpy()
         target_lengths = target_lengths.detach().cpu().numpy()
@@ -467,18 +453,13 @@ class ConvRNNCTCModule(pl.LightningModule):
 
         num_features = self.NUM_BANDS * mlp_features[-1]
 
-        # Model
-        # inputs: (T, N, bands=2, electrode_channels=16, freq)
         self.model = nn.Sequential(
-            # (T, N, bands=2, C=16, freq)
             SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
-            # (T, N, bands=2, mlp_features[-1])
             MultiBandRotationInvariantMLP(
                 in_features=in_features,
                 mlp_features=mlp_features,
                 num_bands=self.NUM_BANDS,
             ),
-            # (T, N, num_features)
             nn.Flatten(start_dim=2),
             ConvRNNEncoder(
                 in_features=num_features,
@@ -488,18 +469,13 @@ class ConvRNNCTCModule(pl.LightningModule):
                 rnn_num_layers=rnn_num_layers,
                 dropout=dropout,
             ),
-            # (T, N, num_classes)
-            nn.Linear(rnn_hidden_size * 2, charset().num_classes),  # *2 because bidirectional
+            nn.Linear(rnn_hidden_size * 2, charset().num_classes),
             nn.LogSoftmax(dim=-1),
         )
 
-        # Criterion
         self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
-
-        # Decoder
         self.decoder = instantiate(decoder)
 
-        # Metrics
         metrics = MetricCollection([CharacterErrorRates()])
         self.metrics = nn.ModuleDict(
             {
@@ -518,33 +494,29 @@ class ConvRNNCTCModule(pl.LightningModule):
         targets = batch["targets"]
         input_lengths = batch["input_lengths"]
         target_lengths = batch["target_lengths"]
-        N = len(input_lengths)  # batch_size
+        N = len(input_lengths)
 
         emissions = self.forward(inputs)
 
-        # Calculate difference in lengths (should be 0 because we pad the Conv1d)
         T_diff = inputs.shape[0] - emissions.shape[0]
         emission_lengths = input_lengths - T_diff
 
         loss = self.ctc_loss(
-            log_probs=emissions,  # (T, N, num_classes)
-            targets=targets.transpose(0, 1),  # (T, N) -> (N, T)
-            input_lengths=emission_lengths,  # (N,)
-            target_lengths=target_lengths,  # (N,)
+            log_probs=emissions,
+            targets=targets.transpose(0, 1),
+            input_lengths=emission_lengths,
+            target_lengths=target_lengths,
         )
 
-        # Decode emissions
         predictions = self.decoder.decode_batch(
             emissions=emissions.detach().cpu().numpy(),
             emission_lengths=emission_lengths.detach().cpu().numpy(),
         )
 
-        # Update metrics
         metrics = self.metrics[f"{phase}_metrics"]
         targets = targets.detach().cpu().numpy()
         target_lengths = target_lengths.detach().cpu().numpy()
         for i in range(N):
-            # Unpad targets (T, N) for batch entry
             target = LabelData.from_labels(targets[: target_lengths[i], i])
             metrics.update(prediction=predictions[i], target=target)
 
