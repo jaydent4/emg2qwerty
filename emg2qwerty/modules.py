@@ -677,3 +677,59 @@ class CNNTransformerEncoder(nn.Module):
             x = self.transformer(x)
 
         return x  # (T, N, model_dim)
+
+
+class ConvRNNEncoder(nn.Module):
+    """A custom encoder composing a 1D convolution over time followed by a
+    multi-layer bidirectional LSTM.
+
+    Args:
+        in_features (int): Input feature size per timestep.
+        conv_channels (int): Number of channels for the 1D convolution.
+        kernel_size (int): Kernel size for the 1D convolution (same padding applied).
+        rnn_hidden_size (int): The hidden size of the LSTM.
+        rnn_num_layers (int): The number of recurrent layers in the LSTM.
+        dropout (float): Dropout probability applied between LSTM layers. (default: 0.1)
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        conv_channels: int,
+        kernel_size: int,
+        rnn_hidden_size: int,
+        rnn_num_layers: int,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        # Conv1d expects input of shape (N, C, T)
+        self.conv1d = nn.Conv1d(
+            in_channels=in_features,
+            out_channels=conv_channels,
+            kernel_size=kernel_size,
+            padding="same",
+        )
+        self.batch_norm = nn.BatchNorm1d(conv_channels)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+
+        # LSTM expects input of shape (T, N, C)
+        self.lstm = nn.LSTM(
+            input_size=conv_channels,
+            hidden_size=rnn_hidden_size,
+            num_layers=rnn_num_layers,
+            bidirectional=True,
+            dropout=dropout if rnn_num_layers > 1 else 0.0,
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # inputs: (T, N, in_features)
+        x = inputs.permute(1, 2, 0)  # (N, in_features, T)
+        x = self.conv1d(x)
+        x = self.batch_norm(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = x.permute(2, 0, 1)      # (T, N, conv_channels)
+        x, _ = self.lstm(x)          # (T, N, rnn_hidden_size * 2)
+        return x
