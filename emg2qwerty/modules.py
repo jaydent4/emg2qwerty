@@ -378,7 +378,6 @@ class ConformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.ff1(x)
-        # Multi-head self-attention with pre-norm
         residual = x
         x_norm = self.attn_norm(x)
         x_attn, _ = self.attn(x_norm, x_norm, x_norm)
@@ -703,7 +702,6 @@ class ConvRNNEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Conv1d expects input of shape (N, C, T)
         self.conv1d = nn.Conv1d(
             in_channels=in_features,
             out_channels=conv_channels,
@@ -714,7 +712,6 @@ class ConvRNNEncoder(nn.Module):
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
 
-        # LSTM expects input of shape (T, N, C)
         self.lstm = nn.LSTM(
             input_size=conv_channels,
             hidden_size=rnn_hidden_size,
@@ -724,7 +721,6 @@ class ConvRNNEncoder(nn.Module):
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        # inputs: (T, N, in_features)
         x = inputs.permute(1, 2, 0)  # (N, in_features, T)
         x = self.conv1d(x)
         x = self.batch_norm(x)
@@ -733,3 +729,49 @@ class ConvRNNEncoder(nn.Module):
         x = x.permute(2, 0, 1)      # (T, N, conv_channels)
         x, _ = self.lstm(x)          # (T, N, rnn_hidden_size * 2)
         return x
+
+
+class TransformerEncoder(nn.Module):
+    """Standard Transformer encoder with chunked inference to prevent OOM.
+
+    Args:
+        num_features (int): Model dimension (d_model).
+        num_heads (int): Number of attention heads.
+        num_layers (int): Number of encoder layers.
+        dim_feedforward (int): FFN inner dimension.
+        dropout (float): Dropout probability.
+        attn_chunk_size (int): Maximum sequence length per attention chunk
+            during inference. Set to 0 to disable. (default: 1000)
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        num_heads: int,
+        num_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        attn_chunk_size: int = 1000,
+    ) -> None:
+        super().__init__()
+        self.attn_chunk_size = attn_chunk_size
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=num_features,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,
+            norm_first=True,
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training and self.attn_chunk_size > 0 and x.size(0) > self.attn_chunk_size:
+            chunks = x.split(self.attn_chunk_size, dim=0)
+            return torch.cat([self.transformer_encoder(c) for c in chunks], dim=0)
+        return self.transformer_encoder(x)
