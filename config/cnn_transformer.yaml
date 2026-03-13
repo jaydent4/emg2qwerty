@@ -40,7 +40,7 @@ hydra:
     dir: logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
     dir: ${hydra.run.dir}
-    subdir: job${hydra.job.num}_${hydra.job.override_dirname}
+    subdir: ${hydra.job.id}
   output_subdir: hydra_configs
   job:
     name: emg2qwerty
